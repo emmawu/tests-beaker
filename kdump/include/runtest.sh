@@ -87,6 +87,7 @@ K_VMCOREPATH=${K_VMCOREPATH:-"/var/crash"}
 [ -f "${KDUMP_CONFIG}.bk" ] || cp "${KDUMP_CONFIG}" "${KDUMP_CONFIG}.bk"
 [ -f "${KDUMP_SYS_CONFIG}.bk" ] || cp "${KDUMP_SYS_CONFIG}" "${KDUMP_SYS_CONFIG}.bk"
 
+
 DisableAVCCheck()
 {
   echo "Disable AVC check"
@@ -421,13 +422,6 @@ PrepareKdump()
         }
         sleep 60
     done
-
-    # Reset kdump config andd restart kdump service
-    Log "- Reset to default kdump config and restart kdump service"
-    ResetKdumpConfig
-    RestartKdump
-    # last try to make sure kdump is ready.
-    sleep 10
 }
 
 DefKdumpMem()
@@ -471,8 +465,9 @@ DefKdumpMem()
     echo "$args"
 }
 
-ResetKdumpConfig()
+DefaultKdumpConfig()
 {
+    Log "- Reset to default kdump config"
     echo >"${KDUMP_CONFIG}"
     echo "path /var/crash" >>"${KDUMP_CONFIG}"
     echo "core_collector makedumpfile -l --message-level 1 -d 31" >>"${KDUMP_CONFIG}"
@@ -511,7 +506,82 @@ AppendConfig()
         shift
     done
 
-    rstrnt-report-log -l "${KDUMP_CONFIG}"
+    RhtsSubmit "${KDUMP_CONFIG}"
+}
+
+
+AppendSysconfig()
+{
+    Log "- Modifying /etc/sysconfig/kdump"
+
+    local KEY=$1
+    local ACTION=$2
+    local VALUE1=$3
+    local VALUE2=$4
+
+    if [ -z "$KEY" ] || [ -z "$ACTION" ] || [ -z "$VALUE1" ]; then
+        Error "- Missing KEY or ACTION or VALUE1."
+        return 1
+    elif [ "$ACTION" = "replace" ] && [ -z "$VALUE2" ]; then
+        Error "- Missing new_value for replacing."
+        return 1
+    elif ! grep "^$KEY=\"" "${KDUMP_SYS_CONFIG}"; then
+        Error "- Invalid KEY: $KEY."
+        return 1
+    fi
+
+    local kdump_sys_config_tmp="${KDUMP_SYS_CONFIG}.tmp"
+    \cp "${KDUMP_SYS_CONFIG}" "${kdump_sys_config_tmp}"
+
+    # Note: When KEY is "KDUMP_COMMANDLINE", ACITION add/remove/replace is actually
+    # manipulating the value of current kernel cmdline and assign
+    # it to KDUMP_COMMANDLINE.
+    # if there is no value set to KDUMP_COMMANLINE, assign current kernel cmdline
+    # to it for later string manipluation.
+    if [ "$KEY" == "KDUMP_COMMANDLINE" ] && \
+        grep "^$KEY=\"[[:space:]]*\"" "${kdump_sys_config_tmp}"; then
+
+        sed -i "/^KDUMP_COMMANDLINE=\"/d" "${kdump_sys_config_tmp}"
+        echo "KDUMP_COMMANDLINE=\"$(cat /proc/cmdline)\"" >> "${kdump_sys_config_tmp}"
+    fi
+
+    case $ACTION in
+        add)
+            # Check if the key already has a value on it, then append " $VALUE1" to the
+            # original value.
+            if grep "^$KEY=\"[[:space:]]*\"" "${kdump_sys_config_tmp}"; then
+                sed -i /^"$KEY="/d "${kdump_sys_config_tmp}"
+                echo "$KEY=\"$VALUE1\"" >> "${kdump_sys_config_tmp}"
+            else
+                sed -i  /^"$KEY="/s/\"/" $VALUE1"\"/2 "${kdump_sys_config_tmp}"
+            fi
+            ;;
+        remove)
+            sed -i  /^"$KEY="/s/"$VALUE1"//g "${kdump_sys_config_tmp}"
+            ;;
+        replace)
+            sed -i  /^"$KEY="/s/"$VALUE1"/"$VALUE2"/g "${kdump_sys_config_tmp}"
+            ;;
+        override)
+            sed -i "/^$KEY=\"/d" "${kdump_sys_config_tmp}"
+            echo "$KEY=\"$VALUE1\"" >> "${kdump_sys_config_tmp}"
+            ;;
+        *)
+            Error "Invalid action '${ACTION}' for editing kdump sysconfig."
+            false
+            ;;
+    esac
+
+    [ $? -ne 0 ] && {
+        Error "- Failed to edit kdump sysconfig"
+        rm -f "${kdump_sys_config_tmp}"
+        return 1
+    }
+
+    \mv "${kdump_sys_config_tmp}" "${KDUMP_SYS_CONFIG}"
+    RhtsSubmit "${KDUMP_SYS_CONFIG}"
+    sync;sync;sync
+    return 0
 }
 
 ReportKdumprd()
@@ -551,6 +621,7 @@ RestartKdump()
     local tmp=""
     local kdumprd=""
     local rc=
+    local KDUMPRD=${1:-"false"}
 
     Log "- Restarting Kdump service."
 
@@ -579,9 +650,11 @@ RestartKdump()
     if grep -v -E "$skip_pat" /tmp/kdump_restart.log |  grep -i -E "can't|error|warn";  then
         Warn 'Restarting kdump reported warn/error message'
     fi
-
     sync;
-    ReportKdumprd
+
+    if [ "$KDUMPRD" != true ]; then
+        ReportKdumprd
+    fi
 }
 
 PrepareCrash()
@@ -687,9 +760,10 @@ GetCorePath()
     # Always analyse the latest vmcore.
     if ls -t "${corepath}"/*/vmcore; then
         vmcore=$(ls -t "${corepath}"/*/vmcore 2>/dev/null | head -1)
+        return 0
     else
         Error "no vmcore found in ${corepath}"
-        Report
+        return 1
     fi
 }
 
@@ -739,4 +813,50 @@ EOF
         fi
 
     fi
+}
+
+RemoveVmcores()
+{
+    local path
+    # Do not remove anything if it's a NFS kdump target
+    [ ! -f "${K_NFS}" ] && {
+        if [ -f "${K_PATH}" ]; then
+            path=$(cat "${K_PATH}")
+        else
+            path=${K_DEFAULT_PATH}
+        fi
+
+        if [ -d "${path}" ]; then
+            Log "- Remove all files in ${path}"
+            rm -rf "${path}"/*
+        fi
+    }
+}
+
+RestoreKdumpConfig()
+{
+    # If nfs kdump is configured, unmount the kdump nfs target
+    [ -f "${K_NFS}" ] && {
+        path=$(cat "${K_NFS}")
+        umount "${path}"
+    }
+
+    rm -f "${K_NFS}" "${K_PATH}" "${K_REBOOT}"
+
+    Log "- Restore /etc/kdump.conf"
+    echo > "${KDUMP_CONFIG}"
+    [ -f "${KDUMP_CONFIG}.bk" ] && \cp -f "${KDUMP_CONFIG}.bk" "${KDUMP_CONFIG}"
+
+    Log "- Restore /etc/sysconfig/kdump"
+    [ -f "${KDUMP_SYS_CONFIG}.bk" ] && \cp -f "${KDUMP_SYS_CONFIG}.bk" "${KDUMP_SYS_CONFIG}"
+
+    RestartKdump
+}
+
+# TestCleanup
+# - Restore Kdump default configurations
+# - Clean up vmcores
+Cleanup(){
+    RemoveVmcores
+    RestoreKdumpConfig
 }
